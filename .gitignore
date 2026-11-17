@@ -1,0 +1,14 @@
+# Secrets
+.Renviron
+
+# Quarto and R build output
+/.quarto/
+*_files/
+.Rhistory
+.RData
+.Rproj.user/
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.vscode/

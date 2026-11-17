@@ -1,0 +1,4 @@
+# Optional. Only needed to refresh the cached EIA data in data/raw/.
+# Free key: https://www.eia.gov/opendata/register.php
+# Copy this file to .Renviron (git ignores it) and paste your key.
+EIA_API_KEY=your_key_here

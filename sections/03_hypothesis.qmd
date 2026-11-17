@@ -1,0 +1,117 @@
+# Hypothesis Tests
+
+## Spike Definition
+
+A spike month is a training month where the year over year change in the real Henry Hub price is above the 90th percentile of all training months. Every other training month is a non spike month. The outcome for each month is the year over year change in the real retail price six months later, so only months with a training outcome six months ahead are used. The year over year measure and the six month horizon are chosen in advance from intuition about how gas costs reach bills, and the time series section is where we check them.
+
+```{r}
+#| label: spike
+# Spike threshold from training months only
+spike_cut <- quantile(train$hh_yoy, 0.9, na.rm = TRUE)
+
+# Outcome is each sector's year over year change six months ahead
+h1 <- train %>%
+  mutate(spike = hh_yoy > spike_cut,
+         y_RES = lead(yoy(rprice_RES), 6),
+         y_COM = lead(yoy(rprice_COM), 6),
+         y_IND = lead(yoy(rprice_IND), 6)) %>%
+  filter(!is.na(hh_yoy))
+
+# Threshold, spike months, and how many separate runs they form
+c(cutoff = spike_cut, spike_months = sum(h1$spike), runs = sum(diff(c(0, h1$spike)) == 1))
+```
+
+## H1: Do Electricity Prices Rise Faster After Gas Spikes?
+
+$H_0: \mu_{spike} = \mu_{other}$ and $H_1: \mu_{spike} > \mu_{other}$, tested separately for each sector.
+
+### Checking assumptions
+
+```{r}
+#| label: h1-qq
+# Normal QQ plots of the outcome in each group
+par(mfrow = c(2, 3))
+for(s in c("RES", "COM", "IND")){
+  y <- h1[[paste0("y_", s)]]
+  qqnorm(y[h1$spike], main = paste(s, "after spike"))
+  qqline(y[h1$spike])
+  qqnorm(y[!h1$spike], main = paste(s, "after non spike"))
+  qqline(y[!h1$spike])
+}
+```
+
+### Tests
+
+Welch's t-test and the Wilcoxon rank sum test assume independent observations. Spike months come in runs and the year over year windows overlap, so that assumption fails and their p values will look too strong. A moving block bootstrap resamples blocks of 12 consecutive months, which keeps that dependence, so it gives the more honest confidence interval.
+
+```{r}
+#| label: h1-tests
+set.seed(123)
+
+# Outcome and spike flag for one sector, months with an outcome only
+h1_data <- function(sector){
+  d <- tibble(y = h1[[paste0("y_", sector)]], spike = h1$spike)
+  filter(d, !is.na(y))
+}
+
+# Moving block bootstrap of the spike minus non spike difference in means
+block_boot <- function(d, block = 12, reps = 2000){
+  n <- nrow(d)
+  nblocks <- ceiling(n / block)
+  diffs <- rep(NA, reps)
+  for(i in 1:reps){
+    # Stack random blocks of consecutive months, then trim to n rows
+    idx <- c()
+    for(b in 1:nblocks){
+      start <- sample(1:(n - block + 1), 1)
+      idx <- c(idx, start:(start + block - 1))
+    }
+    idx <- idx[1:n]
+    boot <- d[idx, ]
+    diffs[i] <- mean(boot$y[boot$spike]) - mean(boot$y[!boot$spike])
+  }
+  quantile(diffs, c(0.025, 0.975), na.rm = TRUE)
+}
+
+h1_test <- function(sector){
+  d <- h1_data(sector)
+  ci <- block_boot(d)
+  tibble(sector = sector,
+         n_spike = sum(d$spike), n_other = sum(!d$spike),
+         mean_spike = mean(d$y[d$spike]), mean_other = mean(d$y[!d$spike]),
+         diff = mean_spike - mean_other,
+         shapiro_spike = shapiro.test(d$y[d$spike])$p.value,
+         shapiro_other = shapiro.test(d$y[!d$spike])$p.value,
+         welch_p = t.test(y ~ spike, data = d, alternative = "less")$p.value,
+         wilcoxon_p = wilcox.test(y ~ spike, data = d, alternative = "less")$p.value,
+         boot_low = ci[1], boot_high = ci[2])
+}
+
+h1_results <- bind_rows(lapply(c("RES", "COM", "IND"), h1_test))
+h1_results
+```
+
+### Block length check
+
+The bootstrap interval should not depend much on the block length. Here it is repeated with blocks of 6, 12 and 24 months.
+
+```{r}
+#| label: h1-block-check
+set.seed(123)
+
+h1_block <- NULL
+for(s in c("RES", "COM", "IND")){
+  d <- h1_data(s)
+  for(b in c(6, 12, 24)){
+    ci <- block_boot(d, block = b)
+    h1_block <- rbind(h1_block, data.frame(sector = s, block = b, low = unname(ci[1]), high = unname(ci[2])))
+  }
+}
+h1_block
+```
+
+> **Assumptions.** The spike groups are close to normal in the QQ plots, but all three non spike groups have a heavy right tail and fail the Shapiro-Wilk test, so we report the Wilcoxon rank sum test next to Welch's t-test. The spike cutoff is $\approx 71.13521$ percent year over year growth in the real Henry Hub price. There are 30 spike months, but they form only 13 separate runs, so the effective sample is much smaller than the p values suggest.
+
+> **Result.** We reject $H_0$ in all three sectors. Average real price growth six months after a spike is higher than after a non spike month by $\approx 2.78023$ percentage points for residential, $\approx 2.58197$ for commercial and $\approx 5.08183$ for industrial. Welch and Wilcoxon p values are all below 0.0001, and the block bootstrap 95% intervals for the difference exclude 0 in every sector. The residential and commercial lower bounds are only about 1 percentage point above 0, so those two effects are less certain than the p values alone imply. The intervals stay above 0 when the blocks are 6, 12 or 24 months long, so the result does not depend on the block length.
+
+> **Takeaway.** Industrial prices respond most, not residential as we expected, so the residential sector having the most inelastic demand does not show up as the largest response.

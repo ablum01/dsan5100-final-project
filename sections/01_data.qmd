@@ -1,0 +1,239 @@
+# Data and Preprocessing
+
+## Sources
+
+All series are monthly. Prices come from the EIA Open Data API and the Henry Hub spreadsheet, and the consumer price index comes from the BLS public API. Raw pulls are cached in `data/raw/`, so the document renders without any key once those files exist. To refresh everything, delete all the files in `data/raw/` and set `EIA_API_KEY` in `.Renviron` (see `.Renviron.example`). Only the two EIA price and generation pulls need the key, since Henry Hub and the CPI are downloaded without one.
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(jsonlite)
+library(plotly)
+library(tseries)
+
+# Print wide tables in full
+options(width = 200, pillar.width = Inf, pillar.sigfig = 7)
+```
+
+```{r}
+#| label: api-helper
+# Pull every page of an EIA API v2 route and return one data frame
+get_eia <- function(route, value, facets){
+  key <- Sys.getenv("EIA_API_KEY")
+  stopifnot(key != "")
+  base <- paste0("https://api.eia.gov/v2/", route, "/data/?api_key=", key,
+                 "&frequency=monthly&data[0]=", value, facets,
+                 "&sort[0][column]=period&sort[0][direction]=asc&length=5000")
+  base <- gsub("\\[", "%5B", gsub("\\]", "%5D", base))
+  out <- list()
+  offset <- 0
+  repeat{
+    res <- fromJSON(paste0(base, "&offset=", offset))$response
+    out[[length(out) + 1]] <- res$data
+    offset <- offset + 5000
+    if(offset >= as.numeric(res$total)) break
+  }
+  bind_rows(out)
+}
+
+# Download once, then reuse the cached CSV
+cache_pull <- function(file, route, value, facets){
+  path <- file.path("data/raw", file)
+  if(!file.exists(path)){
+    write_csv(get_eia(route, value, facets), path)
+  }
+  read_csv(path, show_col_types = FALSE)
+}
+
+# BLS limits each request to 10 years, so pull the CPI in three blocks
+get_cpi <- function(){
+  years <- list(c(2000, 2009), c(2010, 2019), c(2020, 2026))
+  out <- lapply(years, function(y){
+    body <- toJSON(list(seriesid = list("CUUR0000SA0"), startyear = as.character(y[1]), endyear = as.character(y[2])), auto_unbox = TRUE)
+    res <- httr::POST("https://api.bls.gov/publicAPI/v1/timeseries/data/", httr::content_type_json(), body = body)
+    fromJSON(httr::content(res, "text", encoding = "UTF-8"))$Results$series$data[[1]][, c("year", "period", "value")]
+  })
+  bind_rows(out)
+}
+```
+
+```{r}
+#| label: pull
+# Retail price in cents per kWh, by state and sector
+price_raw <- cache_pull("retail_price.csv", "electricity/retail-sales", "price",
+  "&facets[sectorid][]=RES&facets[sectorid][]=COM&facets[sectorid][]=IND")
+
+# Net generation in thousand MWh, natural gas and all fuels, all sectors combined
+gen_raw <- cache_pull("generation.csv", "electricity/electric-power-operational-data", "generation",
+  "&facets[sectorid][]=99&facets[fueltypeid][]=NG&facets[fueltypeid][]=ALL")
+
+# Henry Hub spot price in dollars per million BTU (EIA spreadsheet, no key needed)
+hh_path <- "data/raw/RNGWHHDm.xls"
+if(!file.exists(hh_path)){
+  download.file("https://www.eia.gov/dnav/ng/hist_xls/RNGWHHDm.xls", hh_path, mode = "wb")
+}
+hh_raw <- readxl::read_excel(hh_path, sheet = "Data 1", skip = 2)
+
+# CPI for all urban consumers, all items, not seasonally adjusted (BLS)
+if(!file.exists("data/raw/cpi.csv")) write_csv(get_cpi(), "data/raw/cpi.csv")
+cpi_raw <- read_csv("data/raw/cpi.csv", show_col_types = FALSE)
+
+# Record when the data was downloaded
+if(!file.exists("data/raw/download_date.txt")) writeLines(as.character(Sys.Date()), "data/raw/download_date.txt")
+download_date <- readLines("data/raw/download_date.txt")
+
+c(price = nrow(price_raw), generation = nrow(gen_raw), henry_hub = nrow(hh_raw), cpi = nrow(cpi_raw))
+```
+
+The data was downloaded on `r download_date`. EIA labels its most recent months as preliminary, and they can be revised later. We keep them on purpose, since dropping them would shorten the series and shrink the holdout test.
+
+## Clean and Join
+
+```{r}
+#| label: clean
+# Keep the 50 states only, drop DC, census divisions and the US total
+states <- state.abb
+
+price <- price_raw %>%
+  filter(stateid %in% states) %>%
+  mutate(month = as.Date(paste0(period, "-01")), price = as.numeric(price)) %>%
+  select(state = stateid, month, sector = sectorid, price) %>%
+  pivot_wider(names_from = sector, values_from = price, names_prefix = "price_")
+
+gen <- gen_raw %>%
+  filter(location %in% states) %>%
+  mutate(month = as.Date(paste0(period, "-01")), generation = as.numeric(generation)) %>%
+  select(state = location, month, fuel = fueltypeid, generation) %>%
+  pivot_wider(names_from = fuel, values_from = generation, names_prefix = "gen_") %>%
+  rename(gen_gas = gen_NG, gen_total = gen_ALL)
+
+hh <- hh_raw %>%
+  rename(date = 1, hh_price = 2) %>%
+  mutate(month = as.Date(format(date, "%Y-%m-01"))) %>%
+  select(month, hh_price)
+```
+
+### Adjust for inflation
+
+Nominal prices rise with general inflation, and the biggest gas spikes happened in high inflation years. To keep inflation from looking like a gas effect, every price is converted to 2025 dollars using the CPI. Nominal columns are kept for a robustness check.
+
+```{r}
+#| label: inflation
+cpi <- cpi_raw %>%
+  mutate(month = as.Date(paste0(year, "-", substr(period, 2, 3), "-01")), cpi = suppressWarnings(as.numeric(value))) %>%
+  select(month, cpi) %>%
+  arrange(month)
+
+# BLS did not publish October 2025 (government shutdown), so fill it by interpolation
+cpi$cpi <- approx(cpi$month, cpi$cpi, xout = cpi$month)$y
+cpi %>% filter(month >= "2025-09-01", month <= "2025-11-01")
+
+# Index the CPI so the 2025 average equals 1
+cpi_2025 <- mean(cpi$cpi[format(cpi$month, "%Y") == "2025"])
+
+# Year over year percent change, used throughout
+yoy <- function(x) 100 * (x / dplyr::lag(x, 12) - 1)
+
+macro <- hh %>%
+  inner_join(cpi, by = "month") %>%
+  mutate(cpi_idx = cpi / cpi_2025,
+         hh_real = hh_price / cpi_idx,
+         hh_yoy = yoy(hh_real))
+```
+
+### Join
+
+The sources overlap from January 2001 to August 2026, so the joined data keeps that window. The last 12 months are flagged as the test holdout.
+
+```{r}
+#| label: join
+last_month <- max(price$month)
+holdout_start <- seq(last_month, by = "-11 months", length.out = 2)[2]
+
+dat <- price %>%
+  inner_join(gen, by = c("state", "month")) %>%
+  inner_join(macro, by = "month") %>%
+  # No reported gas generation (HI, a few MT and NE months) means zero gas
+  mutate(gen_gas = replace_na(gen_gas, 0),
+         gas_share = gen_gas / gen_total,
+         rprice_RES = price_RES / cpi_idx,
+         rprice_COM = price_COM / cpi_idx,
+         rprice_IND = price_IND / cpi_idx,
+         holdout = month >= holdout_start) %>%
+  arrange(state, month)
+```
+
+### Flag outliers
+
+A price is flagged when it jumps by more than 20 percent in one month and then reverses by more than 20 percent the next month. Flagged values are kept. Some are real events, such as Texas during Winter Storm Uri, and removing them would remove the gas shocks we want to study. The flags are used for robustness checks.
+
+```{r}
+#| label: outliers
+# TRUE for a one month spike that reverses the next month
+flag_spike <- function(p){
+  jump <- log(p / lag(p))
+  nxt <- lead(jump)
+  abs(jump) > 0.2 & abs(nxt) > 0.2 & sign(jump) != sign(nxt)
+}
+
+dat <- dat %>%
+  group_by(state) %>%
+  mutate(out_RES = flag_spike(price_RES),
+         out_COM = flag_spike(price_COM),
+         out_IND = flag_spike(price_IND)) %>%
+  ungroup()
+
+# Flagged months by sector
+colSums(select(dat, starts_with("out_")), na.rm = TRUE)
+```
+
+## Checks
+
+```{r}
+#| label: checks
+# One row per state and month, 50 states, 308 months
+c(rows = nrow(dat),
+  states = n_distinct(dat$state),
+  months = n_distinct(dat$month),
+  first = as.character(min(dat$month)),
+  last = as.character(max(dat$month)),
+  holdout_months = n_distinct(dat$month[dat$holdout]),
+  duplicates = sum(duplicated(dat[, c("state", "month")])))
+```
+
+```{r}
+#| label: missing
+# Missing values by column
+colSums(is.na(dat))
+```
+
+Alaska has no residential price for August and September 2016, so those two months stay missing. They only affect year over year values for those months.
+
+```{r}
+#| label: save
+# Joined dataset for the rest of the project
+write_csv(dat, "data/joined_monthly.csv")
+```
+
+## National Series and Train Test Split
+
+The time series work uses the US average retail price for each sector and the Henry Hub price. The last 12 months are held out for testing, so every test and model below uses the training months only.
+
+```{r}
+#| label: national
+us <- price_raw %>%
+  filter(stateid == "US") %>%
+  mutate(month = as.Date(paste0(period, "-01")), price = as.numeric(price)) %>%
+  select(month, sector = sectorid, price) %>%
+  pivot_wider(names_from = sector, values_from = price, names_prefix = "price_") %>%
+  inner_join(macro, by = "month") %>%
+  mutate(rprice_RES = price_RES / cpi_idx,
+         rprice_COM = price_COM / cpi_idx,
+         rprice_IND = price_IND / cpi_idx,
+         holdout = month >= holdout_start) %>%
+  arrange(month)
+
+train <- filter(us, !holdout)
+
+c(train_months = nrow(train), test_months = sum(us$holdout))
+```

@@ -1,0 +1,47 @@
+# Time Series Analysis
+
+## Series Specific EDA
+
+### Classical Decomposition
+
+```{r}
+#| label: decompose
+res_ts <- ts(train$rprice_RES, start = c(2001, 1), frequency = 12)
+hh_ts <- ts(train$hh_real, start = c(2001, 1), frequency = 12)
+
+plot(decompose(res_ts, type = "multiplicative"))
+plot(decompose(hh_ts, type = "multiplicative"))
+```
+
+### Autocorrelation and Lag Plots
+
+```{r}
+#| label: acf
+par(mfrow = c(1, 2))
+acf(res_ts, lag.max = 36, main = "Residential Price")
+acf(hh_ts, lag.max = 36, main = "Henry Hub Price")
+lag.plot(res_ts, lags = 12, do.lines = FALSE, main = "Residential Price Lag Plots")
+```
+
+> **Reading the plots.** The residential ACF decays slowly and rises again at multiples of 12 months, and the lag plots tighten again at lag 12, so the series has a strong yearly cycle on top of its trend. The Henry Hub ACF decays slowly with no yearly cycle, which points to a persistent series that drifts.
+
+## Stationarity Tests
+
+The ADF test has a null of a unit root, so a small p value points to stationarity. The KPSS test reverses this, so a small p value points to non stationarity. Each series is tested in levels and as year over year percent change.
+
+```{r}
+#| label: stationarity
+series <- list(
+  Residential = train$rprice_RES, Commercial = train$rprice_COM,
+  Industrial = train$rprice_IND, HenryHub = train$hh_real)
+
+test_series <- function(x){
+  c(adf_p = adf.test(na.omit(x))$p.value, kpss_p = kpss.test(na.omit(x))$p.value)
+}
+
+bind_rows(
+  as_tibble(t(sapply(series, test_series)), rownames = "series") %>% mutate(form = "level"),
+  as_tibble(t(sapply(lapply(series, yoy), test_series)), rownames = "series") %>% mutate(form = "yoy"))
+```
+
+> **Result.** In levels the ADF test is borderline, with p values of $\approx 0.03572$ for residential, $\approx 0.05583$ for commercial, $\approx 0.04991$ for industrial and $\approx 0.02489$ for Henry Hub, while KPSS rejects stationarity for all four (its p value is reported as 0.01, the smallest value the test prints, so the true p value is at most 0.01). In year over year form the two tests agree that all four series are stationary, with ADF p values of at most 0.01 and KPSS p values of at least 0.1. This supports the year over year change we chose in advance for the hypothesis tests.

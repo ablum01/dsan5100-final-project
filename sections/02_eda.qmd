@@ -1,0 +1,83 @@
+# General EDA
+
+All prices below are in 2025 dollars unless labeled nominal.
+
+## Trends Over Time
+
+```{r}
+#| label: plotly-prices
+# Interactive plot of the three sector prices
+plot_ly(train, x = ~month) %>%
+  add_lines(y = ~rprice_RES, name = "Residential") %>%
+  add_lines(y = ~rprice_COM, name = "Commercial") %>%
+  add_lines(y = ~rprice_IND, name = "Industrial") %>%
+  layout(title = "US Retail Electricity Price by Sector",
+         xaxis = list(title = "Month"),
+         yaxis = list(title = "Cents per kWh, 2025 dollars"))
+```
+
+```{r}
+#| label: gg-henry-hub
+# Henry Hub with real world events marked
+events <- tibble(
+  month = as.Date(c("2005-09-01", "2008-07-01", "2020-04-01", "2021-02-01", "2022-08-01")),
+  label = c("Katrina", "2008 peak", "COVID", "Winter Storm Uri", "Ukraine war"))
+
+ggplot(train, aes(month, hh_real)) +
+  geom_line(color = "steelblue") +
+  geom_vline(data = events, aes(xintercept = month), linetype = "dashed") +
+  geom_text(data = events, aes(x = month, y = 15, label = label), angle = 90, vjust = -0.3, hjust = 1, size = 3) +
+  labs(title = "Henry Hub Natural Gas Spot Price", x = "Month", y = "Dollars per million BTU, 2025 dollars")
+```
+
+## Nominal Versus Real
+
+```{r}
+#| label: nominal-real
+# Residential year over year growth, nominal and real
+train %>%
+  transmute(month, Nominal = yoy(price_RES), Real = yoy(rprice_RES)) %>%
+  pivot_longer(-month, names_to = "version", values_to = "growth") %>%
+  ggplot(aes(month, growth, color = version)) +
+  geom_line() +
+  labs(title = "Residential Price Growth, Year over Year", x = "Month", y = "Percent")
+```
+
+## Seasonality
+
+Each month's price is divided by that year's average price, so the trend drops out and only the calendar pattern is left.
+
+```{r}
+#| label: seasonality
+season <- train %>%
+  mutate(year = year(month), cal_month = month(month, label = TRUE)) %>%
+  group_by(year) %>%
+  mutate(across(c(rprice_RES, rprice_COM, rprice_IND, hh_real), ~ .x / mean(.x))) %>%
+  ungroup() %>%
+  group_by(cal_month) %>%
+  summarise(across(c(rprice_RES, rprice_COM, rprice_IND, hh_real), mean)) %>%
+  pivot_longer(-cal_month, names_to = "series", values_to = "index")
+
+ggplot(season, aes(cal_month, index, color = series, group = series)) +
+  geom_line() +
+  labs(title = "Average Price by Calendar Month (1 is the yearly average)", x = "Month", y = "Index")
+
+# Peak month for each series
+season %>% group_by(series) %>% slice_max(index, n = 1)
+```
+
+## Volatility
+
+```{r}
+#| label: volatility
+# Standard deviation of year over year percent change, training months
+train %>%
+  summarise(across(c(hh_real, rprice_RES, rprice_COM, rprice_IND), ~ sd(yoy(.x), na.rm = TRUE)))
+```
+
+# EDA Findings
+
+- Natural gas prices peak in winter, while electricity prices peak in summer. The proposal said gas peaks in summer, so the report should state the winter peak instead.
+- Gas is far more volatile than electricity. The standard deviation of year over year change is $\approx 48.5$ percent for Henry Hub, against $\approx 2.9$ for residential and commercial prices and $\approx 4.8$ for industrial. Industrial is the most volatile electricity sector. Gas has large spikes around 2005, 2008 and 2022.
+- Inflation inflates nominal electricity growth, most visibly in 2022 and 2023, when nominal growth runs well above real growth. That overlaps with the Ukraine war gas spike, which is why the tests use real prices.
+- Residential prices carry a clear seasonal cycle, so we compare months with year over year change, a choice the time series section checks.

@@ -1,0 +1,20 @@
+---
+title: "Examining the Impacts of Natural Gas Fluctuations on Retail Electricity Costs"
+author: "Anand Blum, Petra Chuenarrom, Marco Da Santos Manziano, Michael Taglia"
+date: today
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+{{< include sections/01_data.qmd >}}
+
+{{< include sections/02_eda.qmd >}}
+
+{{< include sections/03_hypothesis.qmd >}}
+
+{{< include sections/04_timeseries.qmd >}}
